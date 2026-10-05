@@ -25,6 +25,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("sim", default_value="true"),
         DeclareLaunchArgument("rviz", default_value="true"),
+        DeclareLaunchArgument("use_base", default_value="false"),
         DeclareLaunchArgument(
             "description_file",
             default_value=PathJoinSubstitution(
@@ -38,7 +39,12 @@ def generate_launch_description():
         Node(
             package="stretch_ee_vel_control",
             executable="ee_velocity",
-            parameters=[{"sim": LaunchConfiguration("sim")}],
+            parameters=[
+                {
+                    "sim": LaunchConfiguration("sim"),
+                    "use_base": LaunchConfiguration("use_base"),
+                }
+            ],
             output="screen",
         ),
 
