@@ -31,6 +31,7 @@ setup(
         'console_scripts': [
             'ee_velocity = stretch_ee_vel_control.ee_velocity:main',
             'ee_tracking_plot = stretch_ee_vel_control.ee_tracking_plot:main',
+            'cbf_filter = stretch_ee_vel_control.cbf_filter:main',
         ],
     },
 )
