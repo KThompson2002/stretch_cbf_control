@@ -115,7 +115,7 @@ class SimBackend:
         self.qd[:] = 0.0
 
 class HardwareBackend:
-    def __init__(self, gripper_pos):
+    def __init__(self, gripper_pos, gripper_rad):
         import stretch_body.robot
         self.r = stretch_body.robot.Robot()
         if not self.r.startup():
@@ -124,7 +124,14 @@ class HardwareBackend:
             self.r.stop()
             raise RuntimeError("Robot is not homed. Run stretch_robot_home.py first.")
         self.gripper_pos = gripper_pos  # (open, closed) in Stretch Body gripper units
+        self.gripper_rad = gripper_rad  # (open, closed) finger angle for RViz
         self.gripper = self.r.end_of_arm.get_joint("stretch_gripper")  # None if no gripper
+
+    def _finger_rad(self, pct):
+        # status["pos"] is the motor angle, not the finger angle, so map pos_pct linearly
+        # from the commanded open/closed positions onto the display angles.
+        (p_open, p_closed), (r_open, r_closed) = self.gripper_pos, self.gripper_rad
+        return r_closed + (pct - p_closed) * (r_open - r_closed) / (p_open - p_closed)
 
     def tick(self, dt):
         pass
@@ -135,7 +142,7 @@ class HardwareBackend:
         return {"lift": r.lift.status["pos"], "arm": r.arm.status["pos"],
                 "wrist": {n: r.end_of_arm.get_joint(s).status["pos"] for n, s in WRIST.items()},
                 "head": {n: r.head.get_joint(s).status["pos"] for n, s in HEAD.items()},
-                "gripper": self.gripper.status["pos"] if self.gripper else 0.0,
+                "gripper": self._finger_rad(self.gripper.status["pos_pct"]) if self.gripper else 0.0,
                 "base": (b["x"], b["y"], b["theta"])}
 
     def send(self, qd):
@@ -207,8 +214,8 @@ class EEVelocityNode(Node):
         self.urdf = self.get_parameter('urdf_path').get_parameter_value().string_value
         self.gripper_pos = (self.get_parameter('gripper_open_pos').value,
                             self.get_parameter('gripper_closed_pos').value)
-        self.sim_gripper_rad = (self.get_parameter('sim_gripper_open_rad').value,
-                                self.get_parameter('sim_gripper_closed_rad').value)
+        self.gripper_rad = (self.get_parameter('gripper_open_rad').value,
+                            self.get_parameter('gripper_closed_rad').value)
         self.dt = 1.0 / self.rate
 
         self.twist = np.zeros(6)
@@ -239,8 +246,8 @@ class EEVelocityNode(Node):
 
     def init_model(self, xml, source):
         self.kin = StretchKinematics(xml, self.ee_frame)
-        self.backend = (SimBackend(self.kin, *self.sim_init, self.sim_gripper_rad) if self.sim
-                        else HardwareBackend(self.gripper_pos))
+        self.backend = (SimBackend(self.kin, *self.sim_init, self.gripper_rad) if self.sim
+                        else HardwareBackend(self.gripper_pos, self.gripper_rad))
         self.get_logger().info(f"Kinematics loaded from {source} ({len(self.kin.joint_names)} joints)")
 
     # ---------------- callbacks ----------------
