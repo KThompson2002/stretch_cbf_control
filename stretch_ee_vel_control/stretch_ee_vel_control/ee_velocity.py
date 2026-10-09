@@ -108,6 +108,11 @@ class SimBackend:
         self.gripper = self.gripper_rad[1] if closed else self.gripper_rad[0]
         return True
 
+    def hold_wrist(self, pose):
+        for n, v in pose.items():
+            lo, hi = self.lim[n]
+            self.q[n] = min(max(v, lo), hi)
+
     def runstopped(self):
         return False
 
@@ -126,6 +131,7 @@ class HardwareBackend:
         self.gripper_pos = gripper_pos  # (open, closed) in Stretch Body gripper units
         self.gripper_rad = gripper_rad  # (open, closed) finger angle for RViz
         self.gripper = self.r.end_of_arm.get_joint("stretch_gripper")  # None if no gripper
+        self.wrist_held = False
 
     def _finger_rad(self, pct):
         # status["pos"] is the motor angle, not the finger angle, so map pos_pct linearly
@@ -150,8 +156,10 @@ class HardwareBackend:
         r.base.set_velocity(qd[0], qd[1])
         r.lift.set_velocity(qd[2])
         r.arm.set_velocity(qd[3])
-        for v, s in zip(qd[4:], WRIST.values()):
-            r.end_of_arm.get_joint(s).set_velocity(v)
+        # A velocity command would switch a held wrist servo out of position mode.
+        if not self.wrist_held:
+            for v, s in zip(qd[4:], WRIST.values()):
+                r.end_of_arm.get_joint(s).set_velocity(v)
         r.push_command()
 
     def set_gripper(self, closed):
@@ -162,6 +170,13 @@ class HardwareBackend:
                                   self.gripper_pos[1] if closed else self.gripper_pos[0])
         self.r.push_command()
         return True
+
+    def hold_wrist(self, pose):
+        # Position commands; the servos then actively hold the pose.
+        for n, v in pose.items():
+            self.r.end_of_arm.move_to(WRIST[n], v)
+        self.r.push_command()
+        self.wrist_held = True
 
     def runstopped(self):
         return bool(self.r.pimu.status.get("runstop_event", False))
@@ -191,8 +206,11 @@ class EEVelocityNode(Node):
         self.declare_parameter("urdf_path", "")
         self.declare_parameter("gripper_open_pos", 50.0)      # Stretch Body gripper units (~-100..100)
         self.declare_parameter("gripper_closed_pos", -50.0)
-        self.declare_parameter("sim_gripper_open_rad", 1.0)   # finger angle shown in RViz (sim)
-        self.declare_parameter("sim_gripper_closed_rad", 0.0)
+        self.declare_parameter("gripper_open_rad", 1.0)       # finger angle shown in RViz
+        self.declare_parameter("gripper_closed_rad", 0.0)
+        # Hold the wrist at a fixed pose instead of using it in the IK. Yaw/pitch/roll [rad].
+        self.declare_parameter("hold_wrist", True)
+        self.declare_parameter("wrist_hold_pose", [0.0, 0.0, 0.0])
         # self.declare_parameter("kin", None)
         # self.declare_parameter("backend", None)
 
@@ -216,6 +234,8 @@ class EEVelocityNode(Node):
                             self.get_parameter('gripper_closed_pos').value)
         self.gripper_rad = (self.get_parameter('gripper_open_rad').value,
                             self.get_parameter('gripper_closed_rad').value)
+        self.hold_wrist = self.get_parameter('hold_wrist').get_parameter_value().bool_value
+        self.wrist_hold_pose = dict(zip(WRIST, self.get_parameter('wrist_hold_pose').value))
         self.dt = 1.0 / self.rate
 
         self.twist = np.zeros(6)
@@ -249,6 +269,9 @@ class EEVelocityNode(Node):
         self.backend = (SimBackend(self.kin, *self.sim_init, self.gripper_rad) if self.sim
                         else HardwareBackend(self.gripper_pos, self.gripper_rad))
         self.get_logger().info(f"Kinematics loaded from {source} ({len(self.kin.joint_names)} joints)")
+        if self.hold_wrist:
+            self.backend.hold_wrist(self.wrist_hold_pose)
+            self.get_logger().info(f"Holding wrist at {self.wrist_hold_pose}")
 
     # ---------------- callbacks ----------------
     def on_twist(self, msg):
@@ -306,6 +329,8 @@ class EEVelocityNode(Node):
 
         if not self.use_base:
             J[:, 0:2] = 0.0
+        if self.hold_wrist:
+            J[:, 4:] = 0.0                               # wrist held in position mode
 
         Winv = np.diag(1.0 / self.weights)               # weighted damped least squares
         qd = Winv @ J.T @ np.linalg.solve(J @ Winv @ J.T + self.lam**2 * np.eye(6), x)
