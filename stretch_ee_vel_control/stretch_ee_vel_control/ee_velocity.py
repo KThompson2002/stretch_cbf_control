@@ -4,7 +4,7 @@ import pinocchio as pin
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from geometry_msgs.msg import TwistStamped, TransformStamped, PoseStamped
 from sensor_msgs.msg import JointState
 from nav_msgs.msg import Path
@@ -16,6 +16,7 @@ WRIST = {"joint_wrist_yaw": "wrist_yaw",
          "joint_wrist_pitch": "wrist_pitch",
          "joint_wrist_roll": "wrist_roll"}
 HEAD = {"joint_head_pan": "head_pan", "joint_head_tilt": "head_tilt"}
+FINGERS = ["joint_gripper_finger_left", "joint_gripper_finger_right"]
 
 
 class StretchKinematics:
@@ -72,9 +73,11 @@ class StretchKinematics:
 class SimBackend:
     """Perfect velocity tracking with URDF joint limits. Good for checking the math, not dynamics."""
 
-    def __init__(self, kin, lift0, arm0):
+    def __init__(self, kin, lift0, arm0, gripper_rad):
         self.kin = kin
         self.q = {"lift": lift0, "arm": arm0, **{n: 0.0 for n in WRIST}}
+        self.gripper_rad = gripper_rad  # (open, closed) finger angle for RViz
+        self.gripper = gripper_rad[0]
         self.base = [0.0, 0.0, 0.0]  # x, y, theta in odom
         self.qd = np.zeros(7)
         lo, hi = kin.limits(ARM[0])
@@ -95,10 +98,15 @@ class SimBackend:
         return {"lift": self.q["lift"], "arm": self.q["arm"],
                 "wrist": {n: self.q[n] for n in WRIST},
                 "head": {n: 0.0 for n in HEAD},
+                "gripper": self.gripper,
                 "base": tuple(self.base)}
 
     def send(self, qd):
         self.qd = np.array(qd, dtype=float)
+
+    def set_gripper(self, closed):
+        self.gripper = self.gripper_rad[1] if closed else self.gripper_rad[0]
+        return True
 
     def runstopped(self):
         return False
@@ -107,7 +115,7 @@ class SimBackend:
         self.qd[:] = 0.0
 
 class HardwareBackend:
-    def __init__(self):
+    def __init__(self, gripper_pos):
         import stretch_body.robot
         self.r = stretch_body.robot.Robot()
         if not self.r.startup():
@@ -115,6 +123,8 @@ class HardwareBackend:
         if not self.r.is_calibrated():
             self.r.stop()
             raise RuntimeError("Robot is not homed. Run stretch_robot_home.py first.")
+        self.gripper_pos = gripper_pos  # (open, closed) in Stretch Body gripper units
+        self.gripper = self.r.end_of_arm.get_joint("stretch_gripper")  # None if no gripper
 
     def tick(self, dt):
         pass
@@ -125,6 +135,7 @@ class HardwareBackend:
         return {"lift": r.lift.status["pos"], "arm": r.arm.status["pos"],
                 "wrist": {n: r.end_of_arm.get_joint(s).status["pos"] for n, s in WRIST.items()},
                 "head": {n: r.head.get_joint(s).status["pos"] for n, s in HEAD.items()},
+                "gripper": self.gripper.status["pos"] if self.gripper else 0.0,
                 "base": (b["x"], b["y"], b["theta"])}
 
     def send(self, qd):
@@ -135,6 +146,15 @@ class HardwareBackend:
         for v, s in zip(qd[4:], WRIST.values()):
             r.end_of_arm.get_joint(s).set_velocity(v)
         r.push_command()
+
+    def set_gripper(self, closed):
+        if self.gripper is None:
+            return False
+        # Position command, not velocity. Push now: step() stops calling send() while idle.
+        self.r.end_of_arm.move_to("stretch_gripper",
+                                  self.gripper_pos[1] if closed else self.gripper_pos[0])
+        self.r.push_command()
+        return True
 
     def runstopped(self):
         return bool(self.r.pimu.status.get("runstop_event", False))
@@ -162,6 +182,10 @@ class EEVelocityNode(Node):
         self.declare_parameter("sim_initial_lift", 0.6)
         self.declare_parameter("sim_initial_arm", 0.1)
         self.declare_parameter("urdf_path", "")
+        self.declare_parameter("gripper_open_pos", 50.0)      # Stretch Body gripper units (~-100..100)
+        self.declare_parameter("gripper_closed_pos", -50.0)
+        self.declare_parameter("sim_gripper_open_rad", 0.4)   # finger angle shown in RViz (sim)
+        self.declare_parameter("sim_gripper_closed_rad", 0.0)
         # self.declare_parameter("kin", None)
         # self.declare_parameter("backend", None)
 
@@ -181,6 +205,10 @@ class EEVelocityNode(Node):
         self.kin = None
         self.backend = None
         self.urdf = self.get_parameter('urdf_path').get_parameter_value().string_value
+        self.gripper_pos = (self.get_parameter('gripper_open_pos').value,
+                            self.get_parameter('gripper_closed_pos').value)
+        self.sim_gripper_rad = (self.get_parameter('sim_gripper_open_rad').value,
+                                self.get_parameter('sim_gripper_closed_rad').value)
         self.dt = 1.0 / self.rate
 
         self.twist = np.zeros(6)
@@ -189,6 +217,7 @@ class EEVelocityNode(Node):
         self.moving = False
 
         self.create_subscription(TwistStamped, "~/ee_cmd_vel", self.on_twist, 10)
+        self.create_subscription(Bool, "~/gripper_cmd", self.on_gripper, 10)  # true = closed
         self.js_pub = self.create_publisher(JointState, "/joint_states", 10)
         self.path_pub = self.create_publisher(Path, "~/ee_path", 10)
 
@@ -210,7 +239,8 @@ class EEVelocityNode(Node):
 
     def init_model(self, xml, source):
         self.kin = StretchKinematics(xml, self.ee_frame)
-        self.backend = SimBackend(self.kin, *self.sim_init) if self.sim else HardwareBackend()
+        self.backend = (SimBackend(self.kin, *self.sim_init, self.sim_gripper_rad) if self.sim
+                        else HardwareBackend(self.gripper_pos))
         self.get_logger().info(f"Kinematics loaded from {source} ({len(self.kin.joint_names)} joints)")
 
     # ---------------- callbacks ----------------
@@ -220,6 +250,18 @@ class EEVelocityNode(Node):
                                 t.angular.x, t.angular.y, t.angular.z])
         self.twist_frame = msg.header.frame_id or "base_link"
         self.last_cmd = self.get_clock().now()
+
+    def on_gripper(self, msg):
+        if self.backend is None:
+            self.get_logger().warn("Gripper command ignored: model not loaded yet")
+            return
+        if self.backend.runstopped():
+            self.get_logger().warn("Gripper command ignored: runstopped")
+            return
+        if not self.backend.set_gripper(msg.data):
+            self.get_logger().warn("Gripper command ignored: no stretch_gripper on end of arm")
+            return
+        self.get_logger().info(f"Gripper {'closing' if msg.data else 'opening'}")
 
     def on_stop(self, _req, res):
         self.twist[:] = 0.0
@@ -278,7 +320,7 @@ class EEVelocityNode(Node):
         # Publish EVERY movable URDF joint (wheels, fingers, ...), or robot_state_publisher
         # can't compute TF for those links and RViz shows them as missing.
         known = {"joint_lift": s["lift"], **{n: s["arm"] / 4.0 for n in ARM},
-                 **s["wrist"], **s["head"]}
+                 **s["wrist"], **s["head"], **{n: s["gripper"] for n in FINGERS}}
         js.name = self.kin.joint_names
         js.position = [float(known.get(n, 0.0)) for n in js.name]
         self.js_pub.publish(js)

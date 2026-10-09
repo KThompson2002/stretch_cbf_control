@@ -11,6 +11,9 @@ In-plane velocities are clamped by a box CBF; the out-of-plane command is droppe
 replaced by a PI correction that holds the EE on the plane (enable_plane_hold).
 dtheta is passed through as angular velocity about the reference z axis.
 
+gripper is not filtered: OPEN/CLOSED is forwarded to gripper_topic (std_msgs/Bool,
+true = closed) only when it changes the commanded state; HOLD leaves the gripper alone.
+
 ~/home (std_srvs/Trigger) drives the EE to the home corner of the box (home_<axis> picks
 min/max/center per in-plane axis, pulled home_margin inside since the CBF never quite
 reaches an edge) and returns once it arrives or times out. While homing, incoming
@@ -26,8 +29,9 @@ from geometry_msgs.msg import Point, TwistStamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from realtime_servo.msg import RelativeMove
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
+from stretch_ee_vel_ctrl_interfaces.msg import RelativeMove
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -62,7 +66,7 @@ class CBFFilter(Node):
         self.declare_parameter('y_min', -0.9)
         self.declare_parameter('y_max', -0.4)
         self.declare_parameter('z_min', 0.825)
-        self.declare_parameter('z_max', 1.3)
+        self.declare_parameter('z_max', 1.2)
 
         # CBF decay rate α: higher values brake harder near boundaries
         self.declare_parameter('cbf_alpha', 1.1)
@@ -75,6 +79,7 @@ class CBFFilter(Node):
         # Topics
         self.declare_parameter('input_topic', '/velocity_pub/vel_command')
         self.declare_parameter('output_topic', '/ee_velocity/ee_cmd_vel')
+        self.declare_parameter('gripper_topic', '/ee_velocity/gripper_cmd')
         self.declare_parameter('enable_plane_hold', True)
         self.declare_parameter('hold_kp', 2.0)
         self.declare_parameter('hold_ki', 0.1)
@@ -114,11 +119,15 @@ class CBFFilter(Node):
         self._home_done = threading.Event()
         self._home_result = (False, '')
 
+        self._gripper_closed = None  # last state forwarded; None until the first command
+
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
         self._cmd_pub = self.create_publisher(
             TwistStamped, self.get_parameter('output_topic').value, 10)
+        self._gripper_pub = self.create_publisher(
+            Bool, self.get_parameter('gripper_topic').value, 10)
         self._cmd_sub = self.create_subscription(
             RelativeMove, self.get_parameter('input_topic').value, self._cmd_cb, 10)
 
@@ -331,7 +340,21 @@ class CBFFilter(Node):
 
         self._marker_pub.publish(MarkerArray(markers=[outline, plane]))
 
+    def _forward_gripper(self, gripper):
+        if gripper == RelativeMove.GRIPPER_HOLD:
+            return
+        if gripper not in (RelativeMove.GRIPPER_OPEN, RelativeMove.GRIPPER_CLOSED):
+            self.get_logger().warn(f'Unknown gripper command {gripper}', throttle_duration_sec=2.0)
+            return
+        closed = gripper == RelativeMove.GRIPPER_CLOSED
+        if closed != self._gripper_closed:
+            self._gripper_closed = closed
+            self._gripper_pub.publish(Bool(data=closed))
+            self.get_logger().info(f'Gripper -> {"closed" if closed else "open"}')
+
     def _cmd_cb(self, msg: RelativeMove):
+        # Gripper goes first so it still works while homing or without EE TF.
+        self._forward_gripper(msg.gripper)
         if self._homing:
             return
         pos = self._get_ee_position()
