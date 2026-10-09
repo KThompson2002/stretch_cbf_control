@@ -184,7 +184,7 @@ class EEVelocityNode(Node):
         self.declare_parameter("urdf_path", "")
         self.declare_parameter("gripper_open_pos", 50.0)      # Stretch Body gripper units (~-100..100)
         self.declare_parameter("gripper_closed_pos", -50.0)
-        self.declare_parameter("sim_gripper_open_rad", 0.4)   # finger angle shown in RViz (sim)
+        self.declare_parameter("sim_gripper_open_rad", 1.0)   # finger angle shown in RViz (sim)
         self.declare_parameter("sim_gripper_closed_rad", 0.0)
         # self.declare_parameter("kin", None)
         # self.declare_parameter("backend", None)
