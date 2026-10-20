@@ -4,11 +4,14 @@ CBF safety filter for Stretch EE velocity control.
 
   RelativeMove (input_topic) -> filter -> TwistStamped (output_topic, consumed by ee_velocity)
 
-The EE is constrained to a plane in reference_frame:
+The EE is constrained to a box (or a plane through it) in reference_frame:
   plane:=xy  -> moves in x/y inside a box, z held at the latched plane
   plane:=yz  -> moves in y/z inside a box, x held at the latched plane
-In-plane velocities are clamped by a box CBF; the out-of-plane command is dropped and
-replaced by a PI correction that holds the EE on the plane (enable_plane_hold).
+  plane:=xyz -> moves in x/y/z inside a 3D box, nothing held
+Free-axis velocities are clamped by a box CBF; in xy/yz the out-of-plane command is dropped
+and replaced by a PI correction that holds the EE on the plane (enable_plane_hold).
+For xyz with ee_velocity's use_base_rotation:=false, x is the base driving, y the arm and
+z the lift. Use reference_frame:=odom there: base motion doesn't move the EE in base_link.
 dtheta is passed through as angular velocity about the reference z axis.
 
 gripper is not filtered: OPEN/CLOSED is forwarded to gripper_topic (std_msgs/Bool,
@@ -56,11 +59,12 @@ class CBFFilter(Node):
     def __init__(self):
         super().__init__('cbf_filter')
 
-        # Plane the EE is limited to: 'xy' or 'yz' (axes of reference_frame)
+        # Axes the EE may move along: 'xy', 'yz' or 'xyz' (axes of reference_frame)
         self.declare_parameter('plane', 'yz')
 
-        # Workspace box bounds in reference_frame [metres]. Only the two in-plane
-        # axes are used. In base_link the arm extends along -y and the lift is +z.
+        # Workspace box bounds in reference_frame [metres]. Only the free axes are
+        # used. In base_link the arm extends along -y and the lift is +z; odom matches
+        # base_link wherever the base started.
         self.declare_parameter('x_min', -0.2)
         self.declare_parameter('x_max', 0.2)
         self.declare_parameter('y_min', -0.9)
@@ -88,7 +92,7 @@ class CBFFilter(Node):
         self.declare_parameter('hold_relatch_s', 0.5)
 
         # Homing
-        #   home_x/y/z:     'min', 'max' or 'center' of the box (in-plane axes only)
+        #   home_x/y/z:     'min', 'max' or 'center' of the box (free axes only)
         #   home_margin:    m, how far inside the box edge the home target sits
         #   home_kp:        1/s, proportional gain toward the target
         #   home_speed_max: m/s, cap on homing speed (straight line, direction kept)
@@ -104,10 +108,16 @@ class CBFFilter(Node):
         self.declare_parameter('home_rate_hz', 30.0)
 
         plane = self.get_parameter('plane').value.lower()
-        if plane not in ('xy', 'yz'):
-            raise ValueError(f"plane must be 'xy' or 'yz', got '{plane}'")
-        self._plane = [AXES.index(c) for c in plane]
-        self._normal = ({0, 1, 2} - set(self._plane)).pop()
+        if plane not in ('xy', 'yz', 'xyz'):
+            raise ValueError(f"plane must be 'xy', 'yz' or 'xyz', got '{plane}'")
+        self._axes = [AXES.index(c) for c in plane]
+        # Axis the plane hold pins; None for xyz, where every axis is free.
+        held = {0, 1, 2} - set(self._axes)
+        self._normal = held.pop() if held else None
+        if self._normal is None and self.get_parameter('reference_frame').value == 'base_link':
+            self.get_logger().warn(
+                'xyz in base_link: base driving does not move the EE in this frame, '
+                'so the x bounds will not stop it. Use reference_frame:=odom.')
 
         self._hold_target = None
         self._hold_integral = 0.0
@@ -141,8 +151,8 @@ class CBFFilter(Node):
         self.create_service(Trigger, '~/home', self._home_cb,
                             callback_group=MutuallyExclusiveCallbackGroup())
 
-        self.get_logger().info(
-            f'CBF filter ready: {plane} plane, holding {AXES[self._normal]}')
+        held = f'holding {AXES[self._normal]}' if self._normal is not None else 'nothing held'
+        self.get_logger().info(f'CBF filter ready: {plane}, {held}')
 
     def _bounds(self, axis):
         c = AXES[axis]
@@ -167,13 +177,15 @@ class CBFFilter(Node):
 
     def _apply_cbf(self, v, pos):
         a = self.get_parameter('cbf_alpha').value
-        for i in self._plane:
+        for i in self._axes:
             lo, hi = self._bounds(i)
             v[i] = _clamp(v[i], -a * (pos[i] - lo), a * (hi - pos[i]))
         return v
 
     def _apply_plane_hold(self, v, pos):
         n = self._normal
+        if n is None:
+            return v
         v[n] = 0.0
         if not self.get_parameter('enable_plane_hold').value:
             return v
@@ -207,7 +219,7 @@ class CBFFilter(Node):
         """Home target in reference_frame; the plane-normal axis stays where it is."""
         m = self.get_parameter('home_margin').value
         target = pos.copy()
-        for i in self._plane:
+        for i in self._axes:
             lo, hi = self._bounds(i)
             side = self.get_parameter(f'home_{AXES[i]}').value
             if side == 'min':
@@ -239,7 +251,7 @@ class CBFFilter(Node):
             return
 
         err = np.zeros(3)
-        err[self._plane] = (self._home_target - pos)[self._plane]
+        err[self._axes] = (self._home_target - pos)[self._axes]
         dist = np.linalg.norm(err)
         if dist < self.get_parameter('home_tolerance').value:
             self._finish_homing(True, f'reached home ({dist * 1000:.1f} mm)')
@@ -282,20 +294,21 @@ class CBFFilter(Node):
 
     def _publish_bounds_marker(self):
         frame = self.get_parameter('reference_frame').value
-        i, j = self._plane
-        (i_min, i_max), (j_min, j_max) = self._bounds(i), self._bounds(j)
+        lo, hi = np.zeros(3), np.zeros(3)
+        for i in self._axes:
+            lo[i], hi[i] = self._bounds(i)
 
-        # Draw the rectangle at the latched plane if available; otherwise at the
-        # current EE position; otherwise at 0 as a last resort.
-        if self._hold_target is not None:
-            offset = self._hold_target
-        else:
-            pos = self._get_ee_position()
-            offset = pos[self._normal] if pos is not None else 0.0
+        # In xy/yz the box is flat: draw it at the latched plane if available;
+        # otherwise at the current EE position; otherwise at 0 as a last resort.
+        if self._normal is not None:
+            if self._hold_target is not None:
+                offset = self._hold_target
+            else:
+                pos = self._get_ee_position()
+                offset = pos[self._normal] if pos is not None else 0.0
+            lo[self._normal] = hi[self._normal] = offset
 
-        def point(a, b):
-            p = [0.0, 0.0, 0.0]
-            p[i], p[j], p[self._normal] = a, b, offset
+        def point(p):
             return Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
 
         now = self.get_clock().now().to_msg()
@@ -305,7 +318,7 @@ class CBFFilter(Node):
         outline.header.stamp = now
         outline.ns = 'cbf_bounds'
         outline.id = 0
-        outline.type = Marker.LINE_STRIP
+        outline.type = Marker.LINE_LIST
         outline.action = Marker.ADD
         outline.scale.x = 0.005
         outline.color.r = 0.1
@@ -313,12 +326,14 @@ class CBFFilter(Node):
         outline.color.b = 0.2
         outline.color.a = 1.0
         outline.pose.orientation.w = 1.0
-        corners = [
-            (i_min, j_min), (i_max, j_min),
-            (i_max, j_max), (i_min, j_max),
-            (i_min, j_min),
-        ]
-        outline.points = [point(a, b) for a, b in corners]
+        # 12 box edges: corner b has bit k set when it sits at hi on axis k; join each
+        # corner to its neighbour along every axis where it sits at lo. A flat box just
+        # draws some edges twice and some with zero length.
+        corners = [np.where([(b >> k) & 1 for k in range(3)], hi, lo) for b in range(8)]
+        for b in range(8):
+            for k in range(3):
+                if not (b >> k) & 1:
+                    outline.points += [point(corners[b]), point(corners[b | 1 << k])]
 
         plane = Marker()
         plane.header.frame_id = frame
@@ -327,12 +342,9 @@ class CBFFilter(Node):
         plane.id = 1
         plane.type = Marker.CUBE
         plane.action = Marker.ADD
-        plane.pose.position = point(0.5 * (i_min + i_max), 0.5 * (j_min + j_max))
+        plane.pose.position = point(0.5 * (lo + hi))
         plane.pose.orientation.w = 1.0
-        scale = [0.001, 0.001, 0.001]
-        scale[i] = max(1e-3, i_max - i_min)
-        scale[j] = max(1e-3, j_max - j_min)
-        plane.scale.x, plane.scale.y, plane.scale.z = scale
+        plane.scale.x, plane.scale.y, plane.scale.z = map(float, np.maximum(hi - lo, 1e-3))
         plane.color.r = 0.1
         plane.color.g = 0.6
         plane.color.b = 1.0

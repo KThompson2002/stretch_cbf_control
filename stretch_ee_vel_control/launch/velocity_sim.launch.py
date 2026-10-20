@@ -25,7 +25,9 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("sim", default_value="true"),
         DeclareLaunchArgument("rviz", default_value="true"),
-        DeclareLaunchArgument("use_base", default_value="false"),
+        # xyz control: base drives EE x (no rotation), arm drives y, lift drives z
+        DeclareLaunchArgument("use_base", default_value="true"),
+        DeclareLaunchArgument("use_base_rotation", default_value="false"),
         DeclareLaunchArgument(
             "description_file",
             default_value=PathJoinSubstitution(
@@ -43,6 +45,7 @@ def generate_launch_description():
                 {
                     "sim": LaunchConfiguration("sim"),
                     "use_base": LaunchConfiguration("use_base"),
+                    "use_base_rotation": LaunchConfiguration("use_base_rotation"),
                 }
             ],
             output="screen",

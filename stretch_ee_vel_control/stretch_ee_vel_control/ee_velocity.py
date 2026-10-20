@@ -197,6 +197,8 @@ class EEVelocityNode(Node):
         self.declare_parameter("cmd_timeout", 0.25)
         self.declare_parameter("damping", 0.05)
         self.declare_parameter("use_base", True)
+        # False: base only drives forward/back, so EE x maps to the base, y to the arm, z to the lift.
+        self.declare_parameter("use_base_rotation", True)
         self.declare_parameter("joint_weights", [4.0, 4.0, 1.0, 1.0, 1.0, 1.0, 1.0])
         self.declare_parameter("vel_limits", [0.10, 0.30, 0.10, 0.10, 1.0, 1.0, 1.0])
         self.declare_parameter("odom_frame", "odom")
@@ -220,6 +222,7 @@ class EEVelocityNode(Node):
         self.timeout = self.get_parameter('cmd_timeout').get_parameter_value().double_value
         self.lam = self.get_parameter('damping').get_parameter_value().double_value
         self.use_base = self.get_parameter('use_base').get_parameter_value().bool_value
+        self.use_base_rotation = self.get_parameter('use_base_rotation').get_parameter_value().bool_value
         self.weights = np.array(self.get_parameter('joint_weights').value, dtype=float)
         self.vmax = np.array(self.get_parameter('vel_limits').value, dtype=float)
         self.odom_frame = self.get_parameter('odom_frame').get_parameter_value().string_value
@@ -329,6 +332,8 @@ class EEVelocityNode(Node):
 
         if not self.use_base:
             J[:, 0:2] = 0.0
+        if not self.use_base_rotation:
+            J[:, 1] = 0.0
         if self.hold_wrist:
             J[:, 4:] = 0.0                               # wrist held in position mode
 
