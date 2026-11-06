@@ -14,8 +14,13 @@ For xyz with ee_velocity's use_base_rotation:=false, x is the base driving, y th
 z the lift. Use reference_frame:=odom there: base motion doesn't move the EE in base_link.
 dtheta is passed through as angular velocity about the reference z axis.
 
-gripper is not filtered: OPEN/CLOSED is forwarded to gripper_topic (std_msgs/Bool,
-true = closed) only when it changes the commanded state; HOLD leaves the gripper alone.
+gripper is not filtered. gripper_mode picks what RelativeMove.gripper means:
+  latch    (default): OPEN/CLOSED is forwarded to gripper_topic (std_msgs/Bool,
+           true = closed) only when it changes the commanded state; HOLD leaves the gripper alone.
+  velocity: OPEN/CLOSED/HOLD mean opening/closing/stop. Every message is forwarded to
+           gripper_dir_topic (std_msgs/Int8, +1/-1/0) so ee_velocity's watchdog stops the
+           gripper when commands stop; ee_velocity moves it at a fixed speed between the
+           open and closed limits.
 
 ~/home (std_srvs/Trigger) drives the EE to the home corner of the box (home_<axis> picks
 min/max/center per in-plane axis, pulled home_margin inside since the CBF never quite
@@ -24,6 +29,7 @@ RelativeMove commands are dropped, so homing takes priority.
 """
 import threading
 import time
+import logging
 
 import numpy as np
 import rclpy
@@ -32,7 +38,7 @@ from geometry_msgs.msg import Point, TwistStamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int8
 from std_srvs.srv import Trigger
 from stretch_ee_vel_ctrl_interfaces.msg import RelativeMove
 from tf2_ros import Buffer, TransformListener
@@ -65,12 +71,13 @@ class CBFFilter(Node):
         # Workspace box bounds in reference_frame [metres]. Only the free axes are
         # used. In base_link the arm extends along -y and the lift is +z; odom matches
         # base_link wherever the base started.
-        self.declare_parameter('x_min', -0.2)
-        self.declare_parameter('x_max', 0.2)
+        self.declare_parameter('x_min', -0.3)
+        self.declare_parameter('x_max', 0.1)
         self.declare_parameter('y_min', -0.9)
         self.declare_parameter('y_max', -0.4)
         self.declare_parameter('z_min', 0.825)
-        self.declare_parameter('z_max', 1.2)
+        self.declare_parameter('z_max', 1.05)
+        # self.declare_parameter('z_max', 1.2)
 
         # CBF decay rate α: higher values brake harder near boundaries
         self.declare_parameter('cbf_alpha', 1.1)
@@ -84,6 +91,8 @@ class CBFFilter(Node):
         self.declare_parameter('input_topic', '/velocity_pub/vel_command')
         self.declare_parameter('output_topic', '/ee_velocity/ee_cmd_vel')
         self.declare_parameter('gripper_topic', '/ee_velocity/gripper_cmd')
+        self.declare_parameter('gripper_mode', 'latch')   # latch | velocity (see module doc)
+        self.declare_parameter('gripper_dir_topic', '/ee_velocity/gripper_dir')
         self.declare_parameter('enable_plane_hold', True)
         self.declare_parameter('hold_kp', 2.0)
         self.declare_parameter('hold_ki', 0.1)
@@ -130,6 +139,9 @@ class CBFFilter(Node):
         self._home_result = (False, '')
 
         self._gripper_closed = None  # last state forwarded; None until the first command
+        self._gripper_mode = self.get_parameter('gripper_mode').value.lower()
+        if self._gripper_mode not in ('latch', 'velocity'):
+            raise ValueError(f"gripper_mode must be 'latch' or 'velocity', got '{self._gripper_mode}'")
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -138,6 +150,8 @@ class CBFFilter(Node):
             TwistStamped, self.get_parameter('output_topic').value, 10)
         self._gripper_pub = self.create_publisher(
             Bool, self.get_parameter('gripper_topic').value, 10)
+        self._gripper_dir_pub = self.create_publisher(
+            Int8, self.get_parameter('gripper_dir_topic').value, 10)
         self._cmd_sub = self.create_subscription(
             RelativeMove, self.get_parameter('input_topic').value, self._cmd_cb, 10)
 
@@ -311,11 +325,14 @@ class CBFFilter(Node):
         def point(p):
             return Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
 
-        now = self.get_clock().now().to_msg()
+        # Stamp 0 = "use the latest TF". In odom, a now-stamp makes RViz wait for an
+        # odom->base_link transform at that exact time, which never comes if the
+        # laptop clock is ahead of the robot's, and the marker is silently dropped.
+        stamp = rclpy.time.Time().to_msg()
 
         outline = Marker()
         outline.header.frame_id = frame
-        outline.header.stamp = now
+        outline.header.stamp = stamp
         outline.ns = 'cbf_bounds'
         outline.id = 0
         outline.type = Marker.LINE_LIST
@@ -337,7 +354,7 @@ class CBFFilter(Node):
 
         plane = Marker()
         plane.header.frame_id = frame
-        plane.header.stamp = now
+        plane.header.stamp = stamp
         plane.ns = 'cbf_bounds'
         plane.id = 1
         plane.type = Marker.CUBE
@@ -353,6 +370,14 @@ class CBFFilter(Node):
         self._marker_pub.publish(MarkerArray(markers=[outline, plane]))
 
     def _forward_gripper(self, gripper):
+        if self._gripper_mode == 'velocity':
+            if gripper not in (RelativeMove.GRIPPER_OPEN, RelativeMove.GRIPPER_CLOSED,
+                               RelativeMove.GRIPPER_HOLD):
+                self.get_logger().warn(f'Unknown gripper command {gripper}', throttle_duration_sec=2.0)
+                gripper = RelativeMove.GRIPPER_HOLD
+            # Every message, so ee_velocity's watchdog stops the gripper when they stop
+            self._gripper_dir_pub.publish(Int8(data=int(gripper)))
+            return
         if gripper == RelativeMove.GRIPPER_HOLD:
             return
         if gripper not in (RelativeMove.GRIPPER_OPEN, RelativeMove.GRIPPER_CLOSED):

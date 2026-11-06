@@ -4,7 +4,7 @@ import pinocchio as pin
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int8, String
 from geometry_msgs.msg import TwistStamped, TransformStamped, PoseStamped
 from sensor_msgs.msg import JointState
 from nav_msgs.msg import Path
@@ -108,6 +108,13 @@ class SimBackend:
         self.gripper = self.gripper_rad[1] if closed else self.gripper_rad[0]
         return True
 
+    def jog_gripper(self, d, stroke_rate, dt, max_lead=None):
+        """Move d (+1 open, -1 close, 0 stop) at stroke_rate (full strokes/s), clamped to open/closed."""
+        r_open, r_closed = self.gripper_rad
+        self.gripper += d * stroke_rate * dt * (r_open - r_closed)
+        self.gripper = min(max(self.gripper, min(r_open, r_closed)), max(r_open, r_closed))
+        return True
+
     def hold_wrist(self, pose):
         for n, v in pose.items():
             lo, hi = self.lim[n]
@@ -132,6 +139,7 @@ class HardwareBackend:
         self.gripper_rad = gripper_rad  # (open, closed) finger angle for RViz
         self.gripper = self.r.end_of_arm.get_joint("stretch_gripper")  # None if no gripper
         self.wrist_held = False
+        self.jog_target = None  # gripper target while jogging; None when stopped
 
     def _finger_rad(self, pct):
         # status["pos"] is the motor angle, not the finger angle, so map pos_pct linearly
@@ -166,8 +174,36 @@ class HardwareBackend:
         if self.gripper is None:
             return False
         # Position command, not velocity. Push now: step() stops calling send() while idle.
+        self.jog_target = None
         self.r.end_of_arm.move_to("stretch_gripper",
                                   self.gripper_pos[1] if closed else self.gripper_pos[0])
+        self.r.push_command()
+        return True
+
+    def jog_gripper(self, d, stroke_rate, dt, max_lead=10.0):
+        """
+        Move d (+1 open, -1 close, 0 stop) at stroke_rate (full strokes/s) by
+        stepping a position target, clamped to the open/closed positions (the
+        hard limits). The target may lead the measured position by at most
+        max_lead gripper units, so closing on an object can't wind it up and
+        reversing responds at once. d == 0 holds the measured position.
+        """
+        if self.gripper is None:
+            return False
+        p_open, p_closed = self.gripper_pos
+        lo, hi = min(p_open, p_closed), max(p_open, p_closed)
+        measured = float(self.gripper.status["pos_pct"])
+        if d == 0:
+            target = min(max(measured, lo), hi)
+            self.jog_target = None
+        else:
+            if self.jog_target is None:
+                self.jog_target = measured
+            step = d * stroke_rate * dt * (p_open - p_closed)   # +d is toward open
+            target = min(max(self.jog_target + step, measured - max_lead), measured + max_lead)
+            target = min(max(target, lo), hi)
+            self.jog_target = target
+        self.r.end_of_arm.move_to("stretch_gripper", target)
         self.r.push_command()
         return True
 
@@ -210,6 +246,10 @@ class EEVelocityNode(Node):
         self.declare_parameter("gripper_closed_pos", -50.0)
         self.declare_parameter("gripper_open_rad", 1.0)       # finger angle shown in RViz
         self.declare_parameter("gripper_closed_rad", 0.0)
+        # ~/gripper_dir jogging (velocity gripper mode): speed in Stretch Body gripper
+        # units/s, and how far the target may lead the measured position (anti-windup).
+        self.declare_parameter("gripper_speed", 50.0)
+        self.declare_parameter("gripper_max_lead", 10.0)
         # Hold the wrist at a fixed pose instead of using it in the IK. Yaw/pitch/roll [rad].
         self.declare_parameter("hold_wrist", True)
         self.declare_parameter("wrist_hold_pose", [0.0, 0.0, 0.0])
@@ -237,6 +277,9 @@ class EEVelocityNode(Node):
                             self.get_parameter('gripper_closed_pos').value)
         self.gripper_rad = (self.get_parameter('gripper_open_rad').value,
                             self.get_parameter('gripper_closed_rad').value)
+        stroke = abs(self.gripper_pos[0] - self.gripper_pos[1])
+        self.grip_stroke_rate = (self.get_parameter('gripper_speed').value / stroke) if stroke > 0 else 0.0
+        self.grip_max_lead = float(self.get_parameter('gripper_max_lead').value)
         self.hold_wrist = self.get_parameter('hold_wrist').get_parameter_value().bool_value
         self.wrist_hold_pose = dict(zip(WRIST, self.get_parameter('wrist_hold_pose').value))
         self.dt = 1.0 / self.rate
@@ -245,9 +288,15 @@ class EEVelocityNode(Node):
         self.twist_frame = "base_link"
         self.last_cmd = self.get_clock().now()
         self.moving = False
+        # Velocity gripper: direction from ~/gripper_dir, expiring after cmd_timeout
+        self.grip_dir = 0
+        self.grip_dir_time = None   # None until the first ~/gripper_dir message
+        self.grip_moving = False
 
         self.create_subscription(TwistStamped, "~/ee_cmd_vel", self.on_twist, 10)
         self.create_subscription(Bool, "~/gripper_cmd", self.on_gripper, 10)  # true = closed
+        # +1 open, -1 close, 0 stop; must be republished faster than cmd_timeout
+        self.create_subscription(Int8, "~/gripper_dir", self.on_gripper_dir, 10)
         self.js_pub = self.create_publisher(JointState, "/joint_states", 10)
         self.path_pub = self.create_publisher(Path, "~/ee_path", 10)
 
@@ -291,10 +340,28 @@ class EEVelocityNode(Node):
         if self.backend.runstopped():
             self.get_logger().warn("Gripper command ignored: runstopped")
             return
+        self.grip_dir, self.grip_moving = 0, False   # a position command ends any jog
         if not self.backend.set_gripper(msg.data):
             self.get_logger().warn("Gripper command ignored: no stretch_gripper on end of arm")
             return
         self.get_logger().info(f"Gripper {'closing' if msg.data else 'opening'}")
+
+    def on_gripper_dir(self, msg):
+        self.grip_dir = int(np.sign(msg.data))
+        self.grip_dir_time = self.get_clock().now()
+
+    def step_gripper(self, now):
+        """Jog the gripper per ~/gripper_dir; stop once it goes stale. No-op in latch mode."""
+        if self.grip_dir_time is None:
+            return
+        stale = (now - self.grip_dir_time).nanoseconds * 1e-9 > self.timeout
+        d = 0 if stale or self.backend.runstopped() else self.grip_dir
+        if d != 0:
+            self.backend.jog_gripper(d, self.grip_stroke_rate, self.dt, self.grip_max_lead)
+            self.grip_moving = True
+        elif self.grip_moving:
+            self.backend.jog_gripper(0, 0.0, self.dt)   # hold where it is
+            self.grip_moving = False
 
     def on_stop(self, _req, res):
         self.twist[:] = 0.0
@@ -314,6 +381,7 @@ class EEVelocityNode(Node):
         J, oMf = self.kin.update(s["lift"], s["arm"], s["wrist"])
         now = self.get_clock().now()
         self.publish_state(s, oMf, now)
+        self.step_gripper(now)   # before the twist early-return: jogs while the arm is idle
 
         stale = (now - self.last_cmd).nanoseconds * 1e-9 > self.timeout
         if stale or self.backend.runstopped() or not np.any(self.twist):

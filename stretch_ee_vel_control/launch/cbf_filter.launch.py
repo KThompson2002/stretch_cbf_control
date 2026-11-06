@@ -22,9 +22,11 @@ PKG = "stretch_ee_vel_control"
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument("plane", default_value="xyz", description="xy, yz or xyz"),
+        DeclareLaunchArgument("plane", default_value="yz", description="xy, yz or xyz"),
         DeclareLaunchArgument("reference_frame", default_value="odom"),
         DeclareLaunchArgument("sim", default_value="false"),
+        DeclareLaunchArgument("gripper_mode", default_value="latch",
+                              description="latch | velocity; must match hardware.gripper_mode"),
         # Only used with sim:=true; on the robot pass these to velocity_sim.launch.py
         DeclareLaunchArgument("use_base", default_value="true"),
         DeclareLaunchArgument("use_base_rotation", default_value="false"),
@@ -44,7 +46,8 @@ def generate_launch_description():
         Node(
             package=PKG, executable="cbf_filter",
             parameters=[{"plane": LaunchConfiguration("plane"),
-                         "reference_frame": LaunchConfiguration("reference_frame")}],
+                         "reference_frame": LaunchConfiguration("reference_frame"),
+                         "gripper_mode": LaunchConfiguration("gripper_mode")}],
             output="screen",
         ),
 
